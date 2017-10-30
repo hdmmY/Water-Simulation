@@ -4,95 +4,298 @@ using UnityEngine;
 
 public class ProjWater : MonoBehaviour
 {
+    // Number of row in mesh
     public int m_row;
 
+    // Number of column in mesh
     public int m_column;
 
+    // The base hight of the sea
     public float m_baseHeight;
 
+    // The amplitude of the wave, use for determin the total sea bound
     public float m_waveAmplitude;
 
-    
-    private List<Vector2> _grid;
+    // Girds that consist of the sea mesh
+    private List<Vector4> _grid;
 
     [SerializeField]
-    private Camera _camera;
+    private Camera _camera;                   
 
-    // The camera eight corner point in world space
-    private List<Vector3> _camCornerWorld;
-
+    // The lowest hight of the sea
     private float _lowerHeight;
+
+    // The upper hight of the sea
     private float _upperHeight;
 
     // Camera frustum intersect with the water bounding box
     private List<Vector3> _camIntersection;
 
+    // The matrix that transfer a point in clip space to world space
     private Matrix4x4 _projectMatrix;
+
+    
+    // Use for render
+    private Mesh _mesh;
+    private MeshFilter _meshFilter;
+    private int[] _triangles;
+    private List<Vector3> _vertices;
+    private List<Vector3> _normals;
+
+    private bool _canRenderer;
 
     private void Start()
     {
-        _grid = CreateGrid();
-
-        _camCornerWorld = GetCameraCornerInWorld();
+        SetInitReference();
 
         _lowerHeight = m_baseHeight + m_waveAmplitude;
         _upperHeight = m_baseHeight - m_waveAmplitude;
 
-        _camIntersection = GetCameraInterSection();
-        //if (_camIntersection.Count == 0) EndRenderer();
+        AdjustAimProjector();
 
-        _projectMatrix = AdjustAimProjector();
-       
-
-    }
-
-    // Create a grid with x = [0, 1], y = [0, 1]
-    private List<Vector2> CreateGrid()
-    {
-        List<Vector2> grid = new List<Vector2>((m_row + 1) * (m_column + 1));
-
-        for (int row = 0; row < m_row + 1; row++)
+        SetCameraInterSection();
+        if(_camIntersection.Count == 0)
         {
-            for (int column = 0; column < m_column + 1; column++)
+            _canRenderer = false;
+        }
+        else
+        {
+            _canRenderer = true;
+        }
+
+        // Get grid point in world space
+        float farRowInterval = 2 * _camera.farClipPlane / m_row;
+        float farColInterval = 2 * _camera.farClipPlane / m_column;
+        float nearRawInterval = 2 * _camera.nearClipPlane / m_row;
+        float nearColInterval = 2 * _camera.nearClipPlane / m_column;
+        _grid = new List<Vector4>((m_column + 1) * (m_row + 1));
+        for (int i = 0; i < m_row + 1; i++)
+        {
+            for (int j = 0; j < m_column + 1; j++)
             {
-                grid.Add(new Vector2(1.0f * column / m_column,
-                                       1.0f * row / m_row));
+                Vector4 upperPoint = new Vector4(
+                        i * nearRawInterval - _camera.nearClipPlane, 
+                        j * nearColInterval - _camera.nearClipPlane,
+                        -_camera.nearClipPlane, _camera.nearClipPlane);
+                upperPoint = _projectMatrix * upperPoint;
+
+                Vector4 underPoint = new Vector4(
+                        i * farRowInterval - _camera.farClipPlane, 
+                        j * farColInterval - _camera.farClipPlane,
+                        _camera.farClipPlane, _camera.farClipPlane);
+                underPoint = _projectMatrix * underPoint;
+
+                float t = (upperPoint.y - m_baseHeight) / (upperPoint.y - underPoint.y);
+                _grid[i] = (Vector4.Lerp(upperPoint, underPoint, t));
             }
         }
 
-        return grid;
+
+        RenderGrid(_grid);
     }
 
-     
-    
-    // Create a custom aiming projector to avoid backfiring.
-    private Matrix4x4 AdjustAimProjector()
+    private void SetInitReference()
     {
-        Vector3 camPosition = _camera.transform.position;
-        Vector3 camDirection = (_camera.ViewportToWorldPoint(new Vector3(0.5f, 0.5f, 1f)) - camPosition);
-        camDirection = camDirection.normalized;
+        _grid = new List<Vector4>(new Vector4[(m_column + 1) * (m_row + 1)]);
+                                                 
+        _camIntersection = new List<Vector3>();
 
-        float t = (camPosition.y - _upperHeight) / camDirection.y;
-        Vector3 intersectPoint = camPosition - camDirection * t;
+        _mesh = new Mesh();
+        _mesh.MarkDynamic();
 
+        _meshFilter = GetComponent<MeshFilter>();
 
+        _vertices = new List<Vector3>(new Vector3[(m_column + 1) * (m_row + 1)]);
+        _triangles = new int[6 * m_column * m_row];
+        _normals = new List<Vector3>(new Vector3[(m_column + 1) * (m_row + 1)]);
+    }
+                                                 
+
+    /// <summary>
+    /// Step 1: Create a custom aiming projector to avoid backfiring.
+    /// </summary>
+    /// <returns></returns>
+    private void AdjustAimProjector()
+    {
         // not adjust view matrix to simplify
-        Matrix4x4 Mpview = Matrix4x4.identity;
-        Matrix4x4 Mperspective = Matrix4x4.Perspective(_camera.fieldOfView, _camera.aspect,
-                            _camera.nearClipPlane, _camera.farClipPlane);
-        Matrix4x4 Mprojector = Matrix4x4.Inverse(Mpview * Mperspective);
+        Matrix4x4 Mpview = GetViewMatrix(_camera);
+        Matrix4x4 Mperspective = GetFrustumMatrix(_camera);
 
-        // Project all intersection point onto base height plane
-        for(int i = 0; i < _camIntersection.Count; i++)
+        _projectMatrix = Matrix4x4.Inverse(Mperspective * Mpview);
+    }
+
+    /// <summary>
+    /// Step 2: Get all points that intersection between the edge of the camera frustum and bound plane
+    /// </summary>
+    /// <returns></returns>
+    private void SetCameraInterSection()
+    {
+        List<Vector3> camCorners = GetCameraCornerInWorld();
+
+        _camIntersection.Clear();
+
+        // check for camera's far-near plane connection lines intersection 
+        for (int i = 0; i < 8; i += 2)
         {
-            _camIntersection[i] = Mprojector * _camIntersection
+            float lineHigh = camCorners[i].y;
+            float lineLow = camCorners[i + 1].y;
+
+            // check lowerHeight intersection
+            if ((lineHigh > _lowerHeight) && (lineLow < _lowerHeight))
+            {
+                float t = (lineHigh - _lowerHeight) / (lineHigh - lineLow);
+                _camIntersection.Add(Vector3.Lerp(camCorners[i], camCorners[i + 1], t));
+            }
+
+            // check upperHeight intersection
+            if ((lineHigh > _upperHeight) && (lineLow < _upperHeight))
+            {
+                float t = (lineHigh - _upperHeight) / (lineHigh - lineLow);
+                _camIntersection.Add(Vector3.Lerp(camCorners[i], camCorners[i + 1], t));
+            }
         }
 
-        return _camera.projectionMatrix;
+        // check for camera's far plane intersection 
+        for (int i = 1; i < 8; i += 2)
+        {
+            int start = i;
+            int end = (i == 7) ? 1 : i + 2;
+
+            float lineHigh = camCorners[start].y;
+            float lineLow = camCorners[end].y;
+
+            // check lowerHeight intersection
+            if ((lineHigh > _lowerHeight) && (lineLow < _lowerHeight))
+            {
+                float t = (lineHigh - _lowerHeight) / (lineHigh - lineLow);
+                _camIntersection.Add(Vector3.Lerp(camCorners[start], camCorners[end], t));
+            }
+
+            // check upperHeight intersection
+            if ((lineHigh > _upperHeight) && (lineLow < _upperHeight))
+            {
+                float t = (lineHigh - _upperHeight) / (lineHigh - lineLow);
+                _camIntersection.Add(Vector3.Lerp(camCorners[start], camCorners[end], t));
+            }
+        }
+
+        // check for camera corner that in the bound box
+        foreach (Vector3 corner in camCorners)
+        {
+            if ((corner.z > _lowerHeight) && (corner.z < _upperHeight))
+            {
+                _camIntersection.Add(corner);
+            }
+        }
     }
 
 
-    
+    /// <summary>
+    /// Step 5: render the grid on the screen
+    /// </summary>
+    /// <param name="grid"></param>
+    private void RenderGrid(List<Vector4> grid)
+    {
+        if (!_canRenderer) return;
+
+        // Init the vertices and normal
+        for (int i = 0; i < grid.Count; i++)
+        {
+            _normals[i] = Vector3.up;
+            _vertices[i] = grid[i];
+        }
+
+        // Set triangles
+        int triangleCount = 0;
+        for (int i = 0; i < m_row; i++)
+        {
+            for (int j = 0; j < m_column; j++)
+            {
+                int offset = i * (m_column + 1) + j;
+                _triangles[3 * triangleCount] = offset;
+                _triangles[3 * triangleCount + 1] = offset + 1;
+                _triangles[3 * triangleCount + 2] = offset + m_column + 1;
+                triangleCount++;
+                _triangles[3 * triangleCount] = offset + 1;
+                _triangles[3 * triangleCount + 1] = offset + m_column + 2;
+                _triangles[3 * triangleCount + 2] = offset + m_column + 1;
+                triangleCount++;
+            }
+        }
+        _mesh.SetVertices(_vertices);
+        _mesh.SetTriangles(_triangles, 0);
+        _mesh.SetNormals(_normals);
+
+        _meshFilter.mesh = _mesh;
+    }
+
+
+    private Matrix4x4 GetRangeMatrix(List<Vector3> intersectionPoints)
+    {
+        // Project all intersection point onto base height plane
+        for (int i = 0; i < intersectionPoints.Count; i++)
+        {
+            Vector3 newIntersectionPoint = intersectionPoints[i];
+            newIntersectionPoint.y = m_baseHeight;
+            intersectionPoints[i] = newIntersectionPoint;
+        }
+
+        // Get the range matrix
+        float xMax = float.MinValue, xMin = float.MaxValue;
+        float zMax = float.MinValue, zMin = float.MaxValue;
+        foreach (var intersectionPoint in intersectionPoints)
+        {
+            if (intersectionPoint.x > xMax) xMax = intersectionPoint.x;
+            if (intersectionPoint.x < xMin) xMin = intersectionPoint.x;
+            if (intersectionPoint.z > zMax) zMax = intersectionPoint.z;
+            if (intersectionPoint.z < zMin) zMin = intersectionPoint.z;
+        }
+
+        return new Matrix4x4(
+            new Vector4(xMax - xMin, 0, 0, 0),
+            new Vector4(0, 1, 0, 0),
+            new Vector4(0, 0, zMax - zMin, 0),
+            new Vector4(xMin, 0, zMin, 1));
+    }
+
+    // Get a camera's frustum matrix
+    private Matrix4x4 GetFrustumMatrix(Camera camera)
+    {
+        float cotFOV = 1f / Mathf.Tan(camera.fieldOfView * Mathf.Deg2Rad * 0.5f);
+        float far = camera.farClipPlane;
+        float near = camera.nearClipPlane;
+
+        var result = new Matrix4x4(
+            new Vector4(cotFOV / camera.aspect, 0, 0, 0),
+            new Vector4(0, cotFOV, 0, 0),
+            new Vector4(0, 0, -(far + near) / (far - near), -1),
+            new Vector4(0, 0, -2 * near * far / (far - near), 0));
+
+        return result;
+    }
+
+    // Get the transform matrix that transform a world point into camera space point
+    private Matrix4x4 GetViewMatrix(Camera camera)
+    {
+        Vector3 xVector = camera.transform.right;
+        Vector3 yVector = camera.transform.up;
+        Vector3 zVector = camera.transform.forward;
+        Vector3 origin = camera.transform.position;
+
+        Matrix4x4 viewToWorld = new Matrix4x4(
+            new Vector4(xVector.x, xVector.y, xVector.z, 0),
+            new Vector4(yVector.x, yVector.y, yVector.z, 0),
+            new Vector4(zVector.x, zVector.y, zVector.z, 0),
+            new Vector4(origin.x, origin.y, origin.z, 1));
+
+        Matrix4x4 nagate = new Matrix4x4(
+            new Vector4(1, 0, 0, 0),
+            new Vector4(0, 1, 0, 0),
+            new Vector4(0, 0, -1, 0),
+            new Vector4(0, 0, 0, 1));
+
+        return nagate * Matrix4x4.Inverse(viewToWorld);
+    }
 
 
     // Get camera corners (+-1, +-1, +-1) in world space
@@ -116,70 +319,6 @@ public class ProjWater : MonoBehaviour
     }
 
 
-    // Get all points that intersection between the edge of the camera frustum and bound plane
-    private List<Vector3> GetCameraInterSection()
-    {
-        List<Vector3> camIntersection = new List<Vector3>();
-
-        // check for camera's far-near plane connection lines intersection 
-        for (int i = 0; i < 8; i += 2)
-        {
-            float lineHigh = _camCornerWorld[i].y;
-            float lineLow = _camCornerWorld[i + 1].y;
-            float lineLength = lineHigh - lineLow;
-
-            // check lowerHeight intersection
-            if ((lineHigh > _lowerHeight) && (lineLow < _lowerHeight))
-            {
-                float t = (_lowerHeight - lineLow) / lineLength;
-                camIntersection.Add(Vector3.Lerp(_camCornerWorld[i], _camCornerWorld[i + 1], t));
-            }
-
-            // check upperHeight intersection
-            if ((lineHigh > _upperHeight) && (lineLow < _upperHeight))
-            {
-                float t = (_upperHeight - lineLow) / lineLength;
-                camIntersection.Add(Vector3.Lerp(_camCornerWorld[i], _camCornerWorld[i + 1], t));
-            }
-        }
-
-        // check for camera's far plane intersection 
-        for (int i = 1; i < 8; i += 2)
-        {
-            int start = i;
-            int end = (i == 7) ? 1 : i + 2;
-
-            float lineHigh = _camCornerWorld[start].y;
-            float lineLow = _camCornerWorld[end].y;
-            float lineLength = lineHigh - lineLow;
-
-            // check lowerHeight intersection
-            if ((lineHigh > _lowerHeight) && (lineLow < _lowerHeight))
-            {
-                float t = (_lowerHeight - lineLow) / lineLength;
-                camIntersection.Add(Vector3.Lerp(_camCornerWorld[start], _camCornerWorld[end], t));
-            }
-
-            // check upperHeight intersection
-            if ((lineHigh > _upperHeight) && (lineLow < _upperHeight))
-            {
-                float t = (_upperHeight - lineLow) / lineLength;
-                camIntersection.Add(Vector3.Lerp(_camCornerWorld[start], _camCornerWorld[end], t));
-            }
-        }
-
-        // check for camera corner that in the bound box
-        foreach (Vector3 corner in _camCornerWorld)
-        {
-            if ((corner.z > _lowerHeight) && (corner.z < _upperHeight))
-            {
-                camIntersection.Add(corner);
-            }
-        }
-
-        return camIntersection;
-    }
-
-
+                
 
 }
